@@ -116,3 +116,73 @@ def _serie_postura(db, galpon, desde):
         salida.append({"fecha": str(fecha), "postura_pct": pct,
                        "huevos": huevos[fecha], "aves": a})
     return salida
+
+
+# ---------- LOTES ----------
+def _fecha_inicio_desde_ciclo(ciclo: str):
+    """El ciclo viene como DDMMYYYY (ej '25092024' -> 2024-09-25)."""
+    if ciclo and len(ciclo) == 8 and ciclo.isdigit():
+        try:
+            return dt.date(int(ciclo[4:8]), int(ciclo[2:4]), int(ciclo[0:2]))
+        except ValueError:
+            return None
+    return None
+
+def _partes_galpon(galpon: str):
+    """De 'Plc15_House15' saca ('Plc15','House15')."""
+    if "_" in galpon:
+        plc, _, casa = galpon.partition("_")
+        return plc, casa
+    return galpon, None
+
+@app.get("/lotes")
+def lotes(activos: Optional[bool] = None, dias_activo: int = 3):
+    """
+    Lista de lotes (galpon + ciclo) con su estado.
+    - activos=true  -> solo lotes con datos recientes
+    - activos=false -> solo historicos
+    - dias_activo   -> margen para considerar 'activo' (default 3 dias)
+    """
+    db = SessionLocal()
+    try:
+        # fecha global mas reciente en toda la base (proxy de "hoy con datos")
+        max_global = db.execute(select(func.max(Registro.fecha_dato))).scalar()
+
+        q = select(
+            Registro.galpon, Registro.ciclo,
+            func.max(Registro.fecha_dato).label("ultima_fecha"),
+            func.min(Registro.fecha_dato).label("primera_fecha"),
+            func.max(Registro.edad_dia).label("edad_dia"),
+            func.max(Registro.semana).label("semana"),
+            func.count().label("registros"),
+        ).group_by(Registro.galpon, Registro.ciclo)
+
+        salida = []
+        for f in db.execute(q).all():
+            plc, casa = _partes_galpon(f.galpon)
+            inicio = _fecha_inicio_desde_ciclo(f.ciclo)
+            es_activo = False
+            if max_global and f.ultima_fecha:
+                es_activo = (max_global - f.ultima_fecha).days <= dias_activo
+            if activos is True and not es_activo:
+                continue
+            if activos is False and es_activo:
+                continue
+            salida.append({
+                "galpon": f.galpon,
+                "plc": plc,
+                "casa": casa,
+                "ciclo": f.ciclo,
+                "fecha_inicio": str(inicio) if inicio else None,
+                "primera_fecha_dato": str(f.primera_fecha),
+                "ultima_fecha_dato": str(f.ultima_fecha),
+                "edad_dia": f.edad_dia,
+                "semana": f.semana,
+                "registros": f.registros,
+                "activo": es_activo,
+            })
+        # ordenar: activos primero, luego por galpon
+        salida.sort(key=lambda x: (not x["activo"], x["galpon"], x["ciclo"]))
+        return salida
+    finally:
+        db.close()

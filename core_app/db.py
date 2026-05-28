@@ -13,6 +13,19 @@ DATABASE_URL = os.environ.get("CORE_DB_URL", "sqlite:///./core.db")
 # check_same_thread solo aplica a sqlite
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, connect_args=connect_args)
+
+# --- SQLite: activar modo WAL para permitir lectura concurrente con escritura ---
+# (en Postgres esto no aplica y se ignora)
+if DATABASE_URL.startswith("sqlite"):
+    from sqlalchemy import event
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_conn, _rec):
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL;")      # lectura mientras se escribe
+        cur.execute("PRAGMA synchronous=NORMAL;")    # mas rapido, seguro con WAL
+        cur.execute("PRAGMA busy_timeout=10000;")    # espera hasta 10s si esta ocupada
+        cur.close()
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 

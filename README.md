@@ -17,6 +17,9 @@ Documentacion interactiva automatica: http://127.0.0.1:8000/docs
 - GET  /galpones             lista galpones con ultima fecha y conteo
 - GET  /galpones/{id}/serie?metrica=huevos
 - GET  /galpones/{id}/serie?metrica=postura   (CALCULADO: huevos/aves*100)
+- GET  /lotes                lista de lotes con fecha inicio, edad, estado activo/historico
+- GET  /lotes?activos=true   solo lotes en produccion
+- GET  /lotes?activos=false  solo lotes historicos
 
 ## Token de ingesta
 Definido en core_app/main.py (TOKEN_INGESTA = "DEV_TOKEN_LOCAL").
@@ -29,4 +32,3 @@ El resto del codigo no cambia.
 
 ## Base de datos
 SQLite genera el archivo core.db en la carpeta donde se levanta.
-# bd-core
