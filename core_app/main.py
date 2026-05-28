@@ -52,25 +52,26 @@ def ingest(registros: List[RegistroIn], authorization: str = Header(default=""))
     if not registros:
         return {"recibidos": 0, "procesados": 0}
 
-    # 1) Convertir a filas y deduplicar dentro del lote por la clave unica
-    #    (Postgres no permite ON CONFLICT afectar la misma fila 2 veces en un comando)
-    por_clave = {}
-    for r in registros:
-        clave = (r.granja, r.galpon, r.ciclo, r.metrica, r.fecha_dato)
-        por_clave[clave] = {
-            "granja": r.granja, "galpon": r.galpon, "ciclo": r.ciclo, "metrica": r.metrica,
-            "fecha_dato": dt.date.fromisoformat(r.fecha_dato),
-            "hora_cierre": r.hora_cierre, "zona_horaria": r.zona_horaria,
-            "valor": r.valor, "edad_dia": r.edad_dia, "semana": r.semana, "fuente": r.fuente,
-        }
-    filas = list(por_clave.values())
-
+    # 1) Procesar en sub-lotes pequenos para no inflar memoria en hostings con 512MB.
+    #    Cada sub-lote se deduplica y se envia, luego se libera.
+    SUB = 200  # tamano que se mantiene comodo en RAM aun con plan Free
     db = SessionLocal()
+    procesados_total = 0
     try:
-        # 2) Upsert MASIVO: un solo statement por sub-lote (1 viaje a la base, no 1 por fila)
-        SUB = 1000  # filas por statement (bajo el limite de parametros de Postgres)
-        for i in range(0, len(filas), SUB):
-            bloque = filas[i:i+SUB]
+        for inicio in range(0, len(registros), SUB):
+            chunk = registros[inicio:inicio+SUB]
+            por_clave = {}
+            for r in chunk:
+                clave = (r.granja, r.galpon, r.ciclo, r.metrica, r.fecha_dato)
+                por_clave[clave] = {
+                    "granja": r.granja, "galpon": r.galpon, "ciclo": r.ciclo, "metrica": r.metrica,
+                    "fecha_dato": dt.date.fromisoformat(r.fecha_dato),
+                    "hora_cierre": r.hora_cierre, "zona_horaria": r.zona_horaria,
+                    "valor": r.valor, "edad_dia": r.edad_dia, "semana": r.semana, "fuente": r.fuente,
+                }
+            bloque = list(por_clave.values())
+            if not bloque:
+                continue
             stmt = _insert(Registro).values(bloque)
             stmt = stmt.on_conflict_do_update(
                 index_elements=["granja","galpon","ciclo","metrica","fecha_dato"],
@@ -84,10 +85,11 @@ def ingest(registros: List[RegistroIn], authorization: str = Header(default=""))
                 },
             )
             db.execute(stmt)
-        db.commit()
+            db.commit()           # commit por sub-lote: libera memoria
+            procesados_total += len(bloque)
     finally:
         db.close()
-    return {"recibidos": len(registros), "procesados": len(filas)}
+    return {"recibidos": len(registros), "procesados": procesados_total}
 
 # ---------- LECTURA ----------
 @app.get("/galpones")
