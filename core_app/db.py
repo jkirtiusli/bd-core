@@ -51,3 +51,20 @@ class Registro(Base):
 
 def init_db():
     Base.metadata.create_all(engine)
+
+
+class LoteMaestro(Base):
+    """Ficha editable de cada lote (cargada a mano). Se vincula por (galpon, ciclo)."""
+    __tablename__ = "lotes_maestros"
+    id = Column(Integer, primary_key=True)
+    galpon = Column(String, nullable=False)
+    ciclo = Column(String, nullable=False)
+    fecha_encasetado = Column(Date)        # la fecha REAL de entrada del lote (fuente de verdad)
+    raza = Column(String)                  # ej. "Lohmann LSL-Lite"
+    aves_iniciales = Column(Integer)
+    encargado = Column(String)
+    etiqueta = Column(String)              # nombre/alias del lote
+    notas = Column(String)
+    __table_args__ = (
+        UniqueConstraint("galpon", "ciclo", name="uq_lote_maestro"),
+    )

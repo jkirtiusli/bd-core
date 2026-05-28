@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: bd-core
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt && python crear_tablas.py"
+    startCommand: "uvicorn core_app.main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: CORE_DB_URL
+        sync: false          # se carga a mano en el panel (secreto)
+      - key: CORE_INGEST_TOKEN
+        sync: false          # se carga a mano en el panel (secreto)

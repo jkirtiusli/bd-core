@@ -4,19 +4,27 @@ Core API (v1, local).
 - POST /ingest : recibe registros del Agente (idempotente).
 - GET endpoints: sirven datos y calculan derivados (postura %, etc.) para "Huevos K".
 """
+import os
 import datetime as dt
 from typing import Optional, List
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy import select, func
 
-from core_app.db import init_db, SessionLocal, Registro
+from core_app.db import init_db, SessionLocal, Registro, LoteMaestro, engine
+
+# Upsert dialect-aware: usa la sintaxis correcta segun sea sqlite o postgres
+if engine.dialect.name == "postgresql":
+    from sqlalchemy.dialects.postgresql import insert as _insert
+else:
+    from sqlalchemy.dialects.sqlite import insert as _insert
 
 app = FastAPI(title="Core Granjas", version="1.0")
 
 # Token simple para el push del Agente (en produccion: uno por granja)
-TOKEN_INGESTA = "DEV_TOKEN_LOCAL"
+# Token de ingesta: SIEMPRE desde variable de entorno en produccion.
+# Si no esta seteada, usa el de desarrollo (solo sirve en local).
+TOKEN_INGESTA = os.environ.get("CORE_INGEST_TOKEN", "DEV_TOKEN_LOCAL")
 
 # Crear tablas al cargar el modulo (idempotente)
 init_db()
@@ -41,27 +49,45 @@ class RegistroIn(BaseModel):
 def ingest(registros: List[RegistroIn], authorization: str = Header(default="")):
     if authorization != f"Bearer {TOKEN_INGESTA}":
         raise HTTPException(status_code=401, detail="Token invalido")
+    if not registros:
+        return {"recibidos": 0, "procesados": 0}
+
+    # 1) Convertir a filas y deduplicar dentro del lote por la clave unica
+    #    (Postgres no permite ON CONFLICT afectar la misma fila 2 veces en un comando)
+    por_clave = {}
+    for r in registros:
+        clave = (r.granja, r.galpon, r.ciclo, r.metrica, r.fecha_dato)
+        por_clave[clave] = {
+            "granja": r.granja, "galpon": r.galpon, "ciclo": r.ciclo, "metrica": r.metrica,
+            "fecha_dato": dt.date.fromisoformat(r.fecha_dato),
+            "hora_cierre": r.hora_cierre, "zona_horaria": r.zona_horaria,
+            "valor": r.valor, "edad_dia": r.edad_dia, "semana": r.semana, "fuente": r.fuente,
+        }
+    filas = list(por_clave.values())
+
     db = SessionLocal()
-    insertados = 0
     try:
-        for r in registros:
-            stmt = sqlite_insert(Registro).values(
-                granja=r.granja, galpon=r.galpon, ciclo=r.ciclo, metrica=r.metrica,
-                fecha_dato=dt.date.fromisoformat(r.fecha_dato),
-                hora_cierre=r.hora_cierre, zona_horaria=r.zona_horaria,
-                valor=r.valor, edad_dia=r.edad_dia, semana=r.semana, fuente=r.fuente,
-            )
-            # idempotente: si ya existe (mismo galpon/metrica/fecha), actualiza el valor
+        # 2) Upsert MASIVO: un solo statement por sub-lote (1 viaje a la base, no 1 por fila)
+        SUB = 1000  # filas por statement (bajo el limite de parametros de Postgres)
+        for i in range(0, len(filas), SUB):
+            bloque = filas[i:i+SUB]
+            stmt = _insert(Registro).values(bloque)
             stmt = stmt.on_conflict_do_update(
                 index_elements=["granja","galpon","ciclo","metrica","fecha_dato"],
-                set_={"valor": r.valor, "edad_dia": r.edad_dia, "semana": r.semana},
+                set_={
+                    "valor": stmt.excluded.valor,
+                    "edad_dia": stmt.excluded.edad_dia,
+                    "semana": stmt.excluded.semana,
+                    "hora_cierre": stmt.excluded.hora_cierre,
+                    "zona_horaria": stmt.excluded.zona_horaria,
+                    "fuente": stmt.excluded.fuente,
+                },
             )
             db.execute(stmt)
-            insertados += 1
         db.commit()
     finally:
         db.close()
-    return {"recibidos": len(registros), "procesados": insertados}
+    return {"recibidos": len(registros), "procesados": len(filas)}
 
 # ---------- LECTURA ----------
 @app.get("/galpones")
@@ -147,6 +173,7 @@ def lotes(activos: Optional[bool] = None, dias_activo: int = 3):
     try:
         # fecha global mas reciente en toda la base (proxy de "hoy con datos")
         max_global = db.execute(select(func.max(Registro.fecha_dato))).scalar()
+        maestros = _maestros_dict(db)
 
         q = select(
             Registro.galpon, Registro.ciclo,
@@ -160,7 +187,7 @@ def lotes(activos: Optional[bool] = None, dias_activo: int = 3):
         salida = []
         for f in db.execute(q).all():
             plc, casa = _partes_galpon(f.galpon)
-            inicio = _fecha_inicio_desde_ciclo(f.ciclo)
+            inicio_ciclo = _fecha_inicio_desde_ciclo(f.ciclo)
             es_activo = False
             if max_global and f.ultima_fecha:
                 es_activo = (max_global - f.ultima_fecha).days <= dias_activo
@@ -168,21 +195,84 @@ def lotes(activos: Optional[bool] = None, dias_activo: int = 3):
                 continue
             if activos is False and es_activo:
                 continue
+
+            # Ficha maestra (si existe): la fecha_encasetado es la FUENTE DE VERDAD de la edad
+            m = maestros.get((f.galpon, f.ciclo))
+            fecha_enc = m.fecha_encasetado if m and m.fecha_encasetado else None
+            ref = max_global if es_activo else f.ultima_fecha  # hasta cuando medir la edad
+            if fecha_enc and ref:
+                edad_real = (ref - fecha_enc).days
+                semana_real = edad_real // 7
+                fuente_edad = "maestro"
+            else:
+                edad_real = None
+                semana_real = None
+                fuente_edad = "sin_dato"  # el edad_dia del PLC no es confiable, no lo usamos como edad real
+
             salida.append({
                 "galpon": f.galpon,
                 "plc": plc,
                 "casa": casa,
                 "ciclo": f.ciclo,
-                "fecha_inicio": str(inicio) if inicio else None,
+                "fecha_inicio_carpeta": str(inicio_ciclo) if inicio_ciclo else None,
                 "primera_fecha_dato": str(f.primera_fecha),
                 "ultima_fecha_dato": str(f.ultima_fecha),
-                "edad_dia": f.edad_dia,
-                "semana": f.semana,
                 "registros": f.registros,
                 "activo": es_activo,
+                # --- edad: solo confiable si hay ficha maestra ---
+                "fecha_encasetado": str(fecha_enc) if fecha_enc else None,
+                "edad_dia": edad_real,
+                "semana": semana_real,
+                "edad_fuente": fuente_edad,
+                "edad_dia_plc": f.edad_dia,   # lo del PLC, a titulo informativo (no confiable)
+                # --- datos maestros ---
+                "raza": m.raza if m else None,
+                "aves_iniciales": m.aves_iniciales if m else None,
+                "encargado": m.encargado if m else None,
+                "etiqueta": m.etiqueta if m else None,
             })
         # ordenar: activos primero, luego por galpon
         salida.sort(key=lambda x: (not x["activo"], x["galpon"], x["ciclo"]))
         return salida
     finally:
         db.close()
+
+
+# ---------- DATOS MAESTROS (ficha editable del lote) ----------
+class LoteMaestroIn(BaseModel):
+    galpon: str
+    ciclo: str
+    fecha_encasetado: Optional[str] = None
+    raza: Optional[str] = None
+    aves_iniciales: Optional[int] = None
+    encargado: Optional[str] = None
+    etiqueta: Optional[str] = None
+    notas: Optional[str] = None
+
+@app.put("/lotes/maestro")
+def upsert_maestro(m: LoteMaestroIn):
+    """Crea o actualiza la ficha maestra de un lote (galpon+ciclo)."""
+    db = SessionLocal()
+    try:
+        vals = dict(
+            galpon=m.galpon, ciclo=m.ciclo,
+            fecha_encasetado=dt.date.fromisoformat(m.fecha_encasetado) if m.fecha_encasetado else None,
+            raza=m.raza, aves_iniciales=m.aves_iniciales,
+            encargado=m.encargado, etiqueta=m.etiqueta, notas=m.notas,
+        )
+        stmt = _insert(LoteMaestro).values(**vals)
+        actualizable = {k: v for k, v in vals.items() if k not in ("galpon", "ciclo")}
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["galpon", "ciclo"], set_=actualizable)
+        db.execute(stmt)
+        db.commit()
+        return {"ok": True, "galpon": m.galpon, "ciclo": m.ciclo}
+    finally:
+        db.close()
+
+def _maestros_dict(db):
+    """Devuelve {(galpon,ciclo): fila_maestro} para combinar con /lotes."""
+    out = {}
+    for f in db.execute(select(LoteMaestro)).scalars().all():
+        out[(f.galpon, f.ciclo)] = f
+    return out
